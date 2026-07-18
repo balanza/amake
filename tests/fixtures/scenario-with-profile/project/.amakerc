@@ -1,0 +1,3 @@
+[profile.fast]
+tool = "echo"
+model = "fast-model"

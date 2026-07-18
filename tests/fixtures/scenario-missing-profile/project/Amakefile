@@ -1,0 +1,6 @@
+[defaults]
+tool = "echo"
+
+[tasks.hello]
+prompt = "Hello"
+profile = "nonexistent"

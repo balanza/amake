@@ -213,6 +213,98 @@ Currently only `claude-code` is supported by clampdown. Other tools fall back to
 
 `agent_policy`, `agent_allow`, `pod_policy`, `memory`, `cpus`, `protect`, `mask`, `unmask`, `gitconfig`, `gh`, `ssh`, `tripwire`, `extra_args` — these map directly to clampdown flags. See [clampdown's docs](https://github.com/89luca89/clampdown) for details.
 
+## Profiles
+
+Profiles let each user maintain their own agent/tool preferences while keeping the `Amakefile` shareable across the team.
+
+A profile is a named set of configuration fields — at minimum a `tool` (which adapter binary to use) and optionally a `model`,
+`auto_approve`, `extra_args`, `timeout`, `idle_warn`, and `idle_kill`. Profiles are defined in user-level config files
+and are resolved at runtime before falling back to the Amakefile `[defaults]`.
+
+### Config file locations
+
+amake loads profiles from two places, layered lowest → highest priority:
+
+| Layer | Location |
+|-------|----------|
+| Built-in defaults | Hard-coded: `amake-large`, `amake-medium`, `amake-small` (all use `claude-code`) |
+| Home config | `~/.config/amake/config.toml` — auto-generated on first run |
+| Project config | `.amakerc` in or above the current directory (first found walking up, stops before home) |
+
+Profiles defined closer to the current working directory override same-named profiles from lower layers.
+
+### Profile syntax
+
+```toml
+# ~/.config/amake/config.toml or .amakerc
+
+[profile.fast]
+tool = "claude-code"
+model = "sonnet"
+
+[profile.safe]
+tool = "aider"
+model = "gpt-4"
+auto_approve = false
+timeout = 120
+```
+
+### Associating a task with a profile
+
+Tasks use the `profile` field (singular — inspired by CSS `font-family` resolution):
+
+```toml
+[tasks.review]
+prompt = "Review the PR."
+profile = "my-custom-profile, small"
+```
+
+The value is a comma-separated list of profile names, tried in order. The first profile whose `tool` binary is
+installed on `$PATH` wins. If none of the named profiles is usable, the built-in `amake-medium` is tried as a
+final fallback. If the entire chain is exhausted, a warning is emitted and execution continues.
+
+When a task doesn't specify a profile, `amake-medium` is the implicit default.
+
+### Precedence (task > profile > Amakefile defaults)
+
+For any setting (`tool`, `model`, `auto_approve`, `timeout`, etc.):
+
+1. **Task-level** value (if set explicitly on the task)
+2. **Resolved profile** value (if the task didn't set it explicitly)
+3. **Amakefile `[defaults]`** value (if neither task nor profile set it)
+
+Task-level `tool`/`model`/etc. are still fully supported for backward compatibility, but the recommended
+pattern is to let the profile provide all tool+model configuration and keep the Amakefile tool-agnostic.
+
+### New CLI commands
+
+```
+amake profile list       # Show all resolved profiles for the current directory,
+                         #   with availability markers (✓ / ✗)
+amake profile init       # Write the built-in profiles to ~/.config/amake/config.toml
+                         #   (does nothing if the file already exists)
+amake profile which <TASK>  # Show which profile would be resolved for a given task,
+                           #   respecting the task's `profile` field
+```
+
+### Quick example
+
+```bash
+# First run auto-generates ~/.config/amake/config.toml with the three built-in profiles
+amake run my-task
+
+# Override at project level
+echo '[profile.fast]
+tool = "echo"
+model = "fast-model"' > .amakerc
+
+# Check which profile a specific task would resolve to
+amake profile which my-task
+
+# See all profiles with availability markers
+amake profile list
+```
+
 ## CLI reference
 
 ```
@@ -228,6 +320,9 @@ amake run <TASKS>... [OPTIONS]
 
 amake list               Show all tasks
 amake adapters           Show built-in adapter names
+amake profile list       Show resolved profiles with availability markers
+amake profile init       Write built-in profiles to ~/.config/amake/config.toml
+amake profile which      Show which profile a task would resolve to
 ```
 
 `--dry-run` still resolves templates, so it's useful for checking that your variables and dependencies are wired up right.

@@ -1,6 +1,7 @@
 use crate::adapter::AdapterRegistry;
 use crate::config::{BackoffStrategy, Config, RetryConfig};
 use crate::error::Error;
+use crate::profile::{Profile, ProfileSet};
 use crate::render::{self, Assets, StreamingRenderer};
 use crate::report::{self, Activity};
 use crate::template;
@@ -115,6 +116,7 @@ pub struct RunOptions {
     pub no_sandbox: bool,
     pub no_format: bool,
     pub vars: BTreeMap<String, String>,
+    pub profile_set: ProfileSet,
 }
 
 pub fn run(config: &Config, targets: &[String], opts: &RunOptions) -> Result<(), Error> {
@@ -139,13 +141,29 @@ pub fn run(config: &Config, targets: &[String], opts: &RunOptions) -> Result<(),
 
     for task_name in &order {
         let task = &config.tasks[task_name];
-        let tool = config.effective_tool(task_name)?;
+
+        // ── resolve profile chain for this task ──
+        let resolved_profile = opts.profile_set.resolve_chain(&task.profile);
+        let profile: Option<&Profile> = match &resolved_profile.0 {
+            Some((_, prof)) => Some(prof),
+            None => {
+                if !resolved_profile.1.is_empty() {
+                    eprintln!(
+                        "warning: no available profile for task {task_name:?}: {}",
+                        resolved_profile.1.join("; ")
+                    );
+                }
+                None
+            }
+        };
+
+        let tool = config.effective_tool(task_name, profile)?;
         let workdir = config.effective_workdir(task);
         let sandbox = config.effective_sandbox(task, opts.force_sandbox, opts.no_sandbox);
-        let timeout = config.effective_timeout(task);
+        let timeout = config.effective_timeout(task, profile);
         let retry = config.effective_retry(task);
-        let idle_warn = config.effective_idle_warn(task);
-        let idle_kill = config.effective_idle_kill(task);
+        let idle_warn = config.effective_idle_warn(task, profile);
+        let idle_kill = config.effective_idle_kill(task, profile);
 
         if sandbox.is_some() && !sandbox_checked {
             check_clampdown()?;
@@ -163,14 +181,23 @@ pub fn run(config: &Config, targets: &[String], opts: &RunOptions) -> Result<(),
 
         let mut rendered_task = task.clone();
         rendered_task.prompt = rendered_prompt;
-        rendered_task.model = config.effective_model(task);
+        rendered_task.model = config.effective_model(task, profile);
+        // Merge profile extra_args before task extra_args so task values win
+        // (last-occurrence-wins for duplicate flags).
+        if let Some(p) = profile
+            && let Some(ref extra) = p.extra_args
+        {
+            let mut combined = extra.clone();
+            combined.extend(rendered_task.extra_args.clone());
+            rendered_task.extra_args = combined;
+        }
 
         let resolved = registry.resolve_or_generic(&tool);
         let adapter = resolved.adapter();
 
         let workdir_ref = workdir.as_deref();
         let sandbox_ref = sandbox.as_ref();
-        let auto_approve = task.auto_approve;
+        let auto_approve = config.effective_auto_approve(task, profile);
         let cmd_builder =
             || adapter.build_command(&rendered_task, workdir_ref, auto_approve, sandbox_ref);
 

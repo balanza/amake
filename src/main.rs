@@ -2,6 +2,7 @@ mod adapter;
 mod config;
 mod editor;
 mod error;
+mod profile;
 mod render;
 mod report;
 mod runner;
@@ -11,6 +12,7 @@ mod template;
 use clap::{Parser, Subcommand};
 use config::Config;
 use error::Error;
+use profile::ProfileSet;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -72,6 +74,27 @@ enum Commands {
 
     /// List built-in adapters
     Adapters,
+
+    /// Manage profiles
+    Profile {
+        #[command(subcommand)]
+        action: ProfileAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ProfileAction {
+    /// List all resolved profiles for the current directory, with availability markers
+    List,
+
+    /// Write built-in profiles to ~/.config/amake/config.toml (create if absent)
+    Init,
+
+    /// Show which profile would be selected for a given task
+    Which {
+        /// Task name
+        task: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -111,6 +134,11 @@ fn run() -> Result<(), Error> {
                 vars.insert(name.clone(), value);
             }
 
+            // Load profiles (auto-generate home config on first run).
+            let cwd = std::env::current_dir()?;
+            let _ = ProfileSet::auto_generate_home_config();
+            let (profile_set, _) = ProfileSet::resolve_layered(&cwd)?;
+
             runner::run(
                 &config,
                 &tasks,
@@ -121,6 +149,7 @@ fn run() -> Result<(), Error> {
                     no_sandbox,
                     no_format,
                     vars,
+                    profile_set,
                 },
             )
         }
@@ -138,6 +167,8 @@ fn run() -> Result<(), Error> {
             }
             Ok(())
         }
+
+        Commands::Profile { action } => handle_profile(action),
     }
 }
 
@@ -192,5 +223,107 @@ fn list_tasks(config: &Config) {
         };
 
         println!("  {name:<max_name$}  [{tool}]  {truncated}");
+    }
+}
+
+fn handle_profile(action: ProfileAction) -> Result<(), Error> {
+    match action {
+        ProfileAction::List => {
+            let cwd = std::env::current_dir()?;
+            let (set, project_path) = ProfileSet::resolve_layered(&cwd)?;
+
+            println!("Profiles resolved for {}", cwd.display());
+            println!("  Home config:   {}", ProfileSet::home_config_path().display());
+            if let Some(ref p) = project_path {
+                println!("  Project config: {}", p.display());
+            }
+            println!();
+
+            for (name, prof) in set.iter() {
+                let available = if ProfileSet::tool_is_available(prof) {
+                    "✓"
+                } else if prof.tool.is_some() {
+                    "✗"
+                } else {
+                    "?"
+                };
+
+                let tool_str = prof.tool.as_deref().unwrap_or("(none)");
+                let model_str = prof.model.as_deref().unwrap_or("(any)");
+                println!("  {available} {name:<20}  tool={tool_str:<15} model={model_str}");
+            }
+
+            Ok(())
+        }
+
+        ProfileAction::Init => {
+            let created = ProfileSet::auto_generate_home_config()?;
+            if created {
+                println!(
+                    "Created {}",
+                    ProfileSet::home_config_path().display()
+                );
+            } else {
+                println!(
+                    "{} already exists",
+                    ProfileSet::home_config_path().display()
+                );
+            }
+            Ok(())
+        }
+
+        ProfileAction::Which { task } => {
+            // Load the config to get the task's profile field
+            let config = match load_config(None) {
+                Ok(c) => c,
+                Err(_) => {
+                    // If no Amakefile, just show resolution without task context
+                    let cwd = std::env::current_dir()?;
+                    let (set, _) = ProfileSet::resolve_layered(&cwd)?;
+                    let names: Vec<String> = task.split(',').map(|s| s.trim().to_string()).collect();
+                    let (resolved, diag) = set.resolve_chain(&names);
+                    print_resolution(&names, &resolved, &diag);
+                    return Ok(());
+                }
+            };
+
+            if !config.tasks.contains_key(&task) {
+                return Err(Error::UnknownTask(task));
+            }
+
+            let cwd = std::env::current_dir()?;
+            let (set, _) = ProfileSet::resolve_layered(&cwd)?;
+
+            let task_profile_names = &config.tasks[&task].profile;
+            let (resolved, diag) = set.resolve_chain(task_profile_names);
+            print_resolution(task_profile_names, &resolved, &diag);
+            Ok(())
+        }
+    }
+}
+
+fn print_resolution(
+    names: &[String],
+    resolved: &Option<(&str, &profile::Profile)>,
+    diag: &[String],
+) {
+    match resolved {
+        Some((name, prof)) => {
+            let names_str = if names.is_empty() {
+                "(default)".to_string()
+            } else {
+                names.join(" → ")
+            };
+            println!("Profile chain: {names_str}");
+            println!("Resolved:      {name}");
+            println!("  tool:  {}", prof.tool.as_deref().unwrap_or("(none)"));
+            println!("  model: {}", prof.model.as_deref().unwrap_or("(any)"));
+        }
+        None => {
+            eprintln!("No available profile found.");
+            for d in diag {
+                eprintln!("  warning: {d}");
+            }
+        }
     }
 }

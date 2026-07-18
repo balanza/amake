@@ -1,0 +1,3 @@
+[profile.amake-medium]
+tool = "echo"
+model = "sonnet"

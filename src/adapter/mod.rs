@@ -96,6 +96,7 @@ mod tests {
             idle_warn: None,
             idle_kill: None,
             model: None,
+            profile: vec![],
         }
     }
 

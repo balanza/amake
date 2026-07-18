@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::profile::Profile;
 use crate::sandbox::SandboxConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -77,6 +78,10 @@ struct RawTask {
     idle_warn: Option<u64>,
     idle_kill: Option<u64>,
     model: Option<String>,
+    /// Comma-separated profile names for task-level resolution.
+    /// Example: "my-custom-profile, small"
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +100,8 @@ pub struct Task {
     pub idle_warn: Option<u64>,
     pub idle_kill: Option<u64>,
     pub model: Option<String>,
+    /// Profile names to try in order (comma-separated, web-font-style resolution).
+    pub profile: Vec<String>,
 }
 
 impl From<RawTask> for Task {
@@ -120,6 +127,7 @@ impl From<RawTask> for Task {
             idle_warn: raw.idle_warn,
             idle_kill: raw.idle_kill,
             model: raw.model,
+            profile: parse_profile_list(raw.profile.as_deref()),
         }
     }
 }
@@ -187,7 +195,7 @@ impl Config {
         Self::from_str(&contents, path)
     }
 
-    pub fn effective_tool(&self, task_name: &str) -> Result<String, Error> {
+    pub fn effective_tool(&self, task_name: &str, profile: Option<&Profile>) -> Result<String, Error> {
         let task = self
             .tasks
             .get(task_name)
@@ -195,14 +203,16 @@ impl Config {
 
         task.tool
             .as_ref()
+            .or_else(|| profile.and_then(|p| p.tool.as_ref()))
             .or(self.defaults.tool.as_ref())
             .cloned()
             .ok_or_else(|| Error::NoTool(task_name.into()))
     }
 
-    pub fn effective_model(&self, task: &Task) -> Option<String> {
+    pub fn effective_model(&self, task: &Task, profile: Option<&Profile>) -> Option<String> {
         task.model
             .as_ref()
+            .or_else(|| profile.and_then(|p| p.model.as_ref()))
             .or(self.defaults.model.as_ref())
             .cloned()
     }
@@ -239,8 +249,16 @@ impl Config {
         }
     }
 
-    pub fn effective_timeout(&self, task: &Task) -> Option<Duration> {
+    pub fn effective_auto_approve(&self, task: &Task, profile: Option<&Profile>) -> bool {
+        task.auto_approve
+            || profile
+                .and_then(|p| p.auto_approve)
+                .unwrap_or(false)
+    }
+
+    pub fn effective_timeout(&self, task: &Task, profile: Option<&Profile>) -> Option<Duration> {
         task.timeout
+            .or_else(|| profile.and_then(|p| p.timeout))
             .or(self.defaults.timeout)
             .map(Duration::from_secs)
     }
@@ -249,14 +267,16 @@ impl Config {
         task.retry.clone().or_else(|| self.defaults.retry.clone())
     }
 
-    pub fn effective_idle_warn(&self, task: &Task) -> Option<Duration> {
+    pub fn effective_idle_warn(&self, task: &Task, profile: Option<&Profile>) -> Option<Duration> {
         task.idle_warn
+            .or_else(|| profile.and_then(|p| p.idle_warn))
             .or(self.defaults.idle_warn)
             .map(Duration::from_secs)
     }
 
-    pub fn effective_idle_kill(&self, task: &Task) -> Option<Duration> {
+    pub fn effective_idle_kill(&self, task: &Task, profile: Option<&Profile>) -> Option<Duration> {
         task.idle_kill
+            .or_else(|| profile.and_then(|p| p.idle_kill))
             .or(self.defaults.idle_kill)
             .map(Duration::from_secs)
     }
@@ -358,6 +378,22 @@ pub fn find_amakefile() -> Result<PathBuf, Error> {
     }
 }
 
+/// Parse a comma-separated profile list string into a `Vec<String>`.
+///
+/// `"my-profile, small"` → `["my-profile", "small"]`
+/// `""` → `[]`
+/// `None` → `[]`
+fn parse_profile_list(s: Option<&str>) -> Vec<String> {
+    match s {
+        None | Some("") => Vec::new(),
+        Some(list) => list
+            .split(',')
+            .map(|item| item.trim().to_string())
+            .filter(|item| !item.is_empty())
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -436,7 +472,7 @@ tool = "aider"
 prompt = "Fix lint"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
-        assert_eq!(cfg.effective_tool("lint").unwrap(), "aider");
+        assert_eq!(cfg.effective_tool("lint", None).unwrap(), "aider");
     }
 
     #[test]
@@ -450,7 +486,7 @@ tool = "claude-code"
 prompt = "Fix lint"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
-        assert_eq!(cfg.effective_tool("lint").unwrap(), "claude-code");
+        assert_eq!(cfg.effective_tool("lint", None).unwrap(), "claude-code");
     }
 
     #[test]
@@ -460,7 +496,7 @@ prompt = "Fix lint"
 prompt = "Fix lint"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
-        assert!(matches!(cfg.effective_tool("lint"), Err(Error::NoTool(_))));
+        assert!(matches!(cfg.effective_tool("lint", None), Err(Error::NoTool(_))));
     }
 
     #[test]
@@ -646,7 +682,7 @@ prompt = "x"
 timeout = 5
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
-        let effective = cfg.effective_timeout(&cfg.tasks["t"]).unwrap();
+        let effective = cfg.effective_timeout(&cfg.tasks["t"], None).unwrap();
         assert_eq!(effective, Duration::from_secs(5));
     }
 
@@ -660,7 +696,7 @@ timeout = 42
 prompt = "x"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
-        let effective = cfg.effective_timeout(&cfg.tasks["t"]).unwrap();
+        let effective = cfg.effective_timeout(&cfg.tasks["t"], None).unwrap();
         assert_eq!(effective, Duration::from_secs(42));
     }
 
@@ -706,7 +742,7 @@ prompt = "x"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
         assert_eq!(
-            cfg.effective_model(&cfg.tasks["t"]).as_deref(),
+            cfg.effective_model(&cfg.tasks["t"], None).as_deref(),
             Some("opus")
         );
     }
@@ -723,7 +759,7 @@ model = "sonnet"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
         assert_eq!(
-            cfg.effective_model(&cfg.tasks["t"]).as_deref(),
+            cfg.effective_model(&cfg.tasks["t"], None).as_deref(),
             Some("sonnet")
         );
     }
@@ -735,6 +771,6 @@ model = "sonnet"
 prompt = "x"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
-        assert!(cfg.effective_model(&cfg.tasks["t"]).is_none());
+        assert!(cfg.effective_model(&cfg.tasks["t"], None).is_none());
     }
 }

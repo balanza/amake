@@ -106,6 +106,22 @@ pub enum Error {
 
     #[error("{0}")]
     Io(#[from] std::io::Error),
+
+    // ── profile-related errors ──
+
+    /// A `.amakerc` or home profile config could not be read.
+    #[error("failed to read profile config {path}: {source}")]
+    ProfileConfigRead {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// A `.amakerc` or home profile config contains invalid TOML.
+    #[error("failed to parse profile config {path}: {source}")]
+    ProfileConfigParse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
 }
 
 fn format_task_failed(

@@ -1,0 +1,2 @@
+[profile.amake-medium]
+tool = "this-tool-definitely-does-not-exist"

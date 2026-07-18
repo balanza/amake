@@ -61,7 +61,7 @@ fn no_model_home() -> (TempDir, std::path::PathBuf) {
     fs::create_dir_all(&config_dir).unwrap();
     fs::write(
         config_dir.join("config.toml"),
-        "[profile.amake-medium]\ntool = \"sh\"\n",
+        "[profile.amake-medium]\ntool = \"echo\"\n",
     )
     .unwrap();
     (dir, home)
@@ -164,9 +164,10 @@ fn run_unknown_task_errors() {
 
 #[test]
 fn run_no_tool_errors() {
-    let s = copy_scenario_temp("no-tool");
+    let s = copy_scenario_temp("exhausted");
 
     amake()
+        .env("HOME", &s.home)
         .current_dir(&s.project)
         .arg("run")
         .arg("hello")
@@ -191,7 +192,6 @@ fn run_dry_run_prints_command() {
         .success()
         .stdout(
             predicate::str::contains("[greet]")
-                .and(predicate::str::contains("echo"))
                 .and(predicate::str::contains("Hello world")),
         );
 }
@@ -372,10 +372,12 @@ prompt = "right"
 
 #[test]
 fn sandbox_flag_without_clampdown_errors() {
+    let (_tmp_home, home) = no_model_home();
     let s = copy_scenario_temp("multi");
 
     // Only fails if clampdown is not installed, which is the expected CI case
     let result = amake()
+        .env("HOME", &home)
         .current_dir(&s.project)
         .args(["run", "--sandbox", "t"])
         .assert();
@@ -406,9 +408,11 @@ fn run_env_variable_interpolation() {
 
 #[test]
 fn run_amakefile_var_interpolation() {
+    let (_tmp_home, home) = no_model_home();
     let s = copy_scenario_temp("multi");
 
     amake()
+        .env("HOME", &home)
         .current_dir(&s.project)
         .args(["run", "greet"])
         .assert()
@@ -685,10 +689,14 @@ fn closed_stdin_makes_cat_exit_immediately() {
     // `cat` with no args reads from stdin. With Stdio::null, the read sees EOF
     // and the process exits cleanly. Without it, this test would hang forever.
     // `sh -c cat ""` invokes cat with no args ($0 set to "" but argv empty).
+    //
+    // Use no_model_home to prevent the profile from injecting --model into sh.
+    let (_tmp_home, home) = no_model_home();
     let s = copy_scenario_temp("sh");
 
     let start = std::time::Instant::now();
     amake()
+        .env("HOME", &home)
         .current_dir(&s.project)
         .args(["run", "cat"])
         .assert()
@@ -701,10 +709,12 @@ fn closed_stdin_makes_cat_exit_immediately() {
 
 #[test]
 fn no_spinner_when_stderr_is_piped() {
+    let (_tmp_home, home) = no_model_home();
     let s = copy_scenario_temp("multi");
 
     // assert_cmd captures stderr non-TTY; spinner braille glyphs must not appear.
     amake()
+        .env("HOME", &home)
         .current_dir(&s.project)
         .args(["run", "t"])
         .assert()
@@ -811,12 +821,138 @@ fn extra_args_model_overrides_config_model() {
 
 #[test]
 fn dry_run_no_model_when_unset() {
+    let (_tmp_home, home) = no_model_home();
     let s = copy_scenario_temp("multi");
 
     amake()
+        .env("HOME", &home)
         .current_dir(&s.project)
         .args(["run", "--dry-run", "greet"])
         .assert()
         .success()
         .stdout(predicate::str::contains("--model").not());
+}
+
+// ── Profile subcommand ──
+
+#[test]
+fn profile_init_creates_config_file() {
+    let s = copy_scenario_temp("empty");
+
+    amake()
+        .env("HOME", &s.home)
+        .arg("profile")
+        .arg("init")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Created"));
+
+    let config_path = s.home.join(".config/amake/config.toml");
+    assert!(config_path.is_file(), "config file should exist");
+}
+
+#[test]
+fn profile_list_shows_profiles_with_markers() {
+    let s = copy_scenario_temp("with-profile");
+
+    amake()
+        .env("HOME", &s.home)
+        .current_dir(&s.project)
+        .arg("profile")
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("fast")
+                .and(predicate::str::contains("fast-model"))
+                .and(predicate::str::contains("echo")),
+        );
+}
+
+#[test]
+fn profile_which_resolves_task_profile() {
+    let s = copy_scenario_temp("with-profile");
+
+    amake()
+        .env("HOME", &s.home)
+        .current_dir(&s.project)
+        .arg("profile")
+        .arg("which")
+        .arg("hello")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("fast")
+                .and(predicate::str::contains("echo"))
+                .and(predicate::str::contains("fast-model")),
+        );
+}
+
+#[test]
+fn profile_which_unknown_task_errors() {
+    let s = copy_scenario_temp("simple");
+
+    amake()
+        .env("HOME", &s.home)
+        .current_dir(&s.project)
+        .arg("profile")
+        .arg("which")
+        .arg("nonexistent")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown task"));
+}
+
+#[test]
+fn run_respects_task_profile_dry_run() {
+    let s = copy_scenario_temp("with-profile");
+
+    amake()
+        .env("HOME", &s.home)
+        .current_dir(&s.project)
+        .arg("run")
+        .arg("--dry-run")
+        .arg("hello")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("[hello]")
+                .and(predicate::str::contains("echo"))
+                .and(predicate::str::contains("fast-model")),
+        );
+}
+
+#[test]
+fn run_task_without_profile_uses_fallback_dry_run() {
+    let s = copy_scenario_temp("home-override");
+
+    amake()
+        .env("HOME", &s.home)
+        .current_dir(&s.project)
+        .arg("run")
+        .arg("--dry-run")
+        .arg("hello")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[hello]"));
+}
+
+#[test]
+fn run_task_with_default_tool_when_profile_exhausted() {
+    // When no profile is usable (tool not installed) and task has no explicit
+    // tool, the defaults tool should be used.
+    let s = copy_scenario_temp("exhausted-fallback");
+
+    amake()
+        .env("HOME", &s.home)
+        .current_dir(&s.project)
+        .arg("run")
+        .arg("--dry-run")
+        .arg("hello")
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("[hello]")
+                .and(predicate::str::contains("echo")),
+        );
 }

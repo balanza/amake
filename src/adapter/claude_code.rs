@@ -48,7 +48,7 @@ impl Adapter for ClaudeCodeAdapter {
         }
 
         cmd.args(&task.extra_args);
-        cmd.arg(&task.prompt);
+        cmd.arg(task.prompt.as_deref().unwrap_or(""));
 
         apply_workdir(&mut cmd, sandboxed, workdir);
 

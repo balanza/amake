@@ -61,6 +61,14 @@ enum Commands {
         /// Disable syntax-highlighted markdown rendering of task output
         #[arg(long)]
         no_format: bool,
+
+        /// On script tasks: run script, if it fails dispatch the prompt to the AI tool
+        #[arg(long)]
+        fix: bool,
+
+        /// On script tasks: run script, if it fails dispatch the AI, then re-run until clean
+        #[arg(long)]
+        redo: bool,
     },
 
     /// List all tasks in the Amakefile
@@ -98,6 +106,8 @@ fn run() -> Result<(), Error> {
             sandbox,
             no_sandbox,
             no_format,
+            fix,
+            redo,
         } => {
             let config = load_config(file)?;
             let mut vars = config.vars.clone();
@@ -120,6 +130,8 @@ fn run() -> Result<(), Error> {
                     force_sandbox: sandbox,
                     no_sandbox,
                     no_format,
+                    fix,
+                    redo,
                     vars,
                 },
             )
@@ -178,17 +190,29 @@ fn list_tasks(config: &Config) {
             .or(config.defaults.tool.as_deref())
             .unwrap_or("(none)");
 
-        let first_line = task
-            .prompt
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("")
-            .trim();
-
-        let truncated = if first_line.len() > 60 {
-            format!("{}...", &first_line[..57])
+        let description = if let Some(ref prompt) = task.prompt {
+            prompt
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        } else if let Some(ref script) = task.script {
+            // Show script as description when there's no prompt.
+            let s = script.trim();
+            if s.len() > 60 {
+                format!("{}...", &s[..57])
+            } else {
+                s.to_string()
+            }
         } else {
-            first_line.to_string()
+            String::from("(no prompt)")
+        };
+
+        let truncated = if description.len() > 60 {
+            format!("{}...", &description[..57])
+        } else {
+            description
         };
 
         println!("  {name:<max_name$}  [{tool}]  {truncated}");

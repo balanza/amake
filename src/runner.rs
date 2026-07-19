@@ -3,15 +3,24 @@ use crate::config::{BackoffStrategy, Config, RetryConfig};
 use crate::error::Error;
 use crate::render::{self, Assets, StreamingRenderer};
 use crate::report::{self, Activity};
+use crate::sandbox::SandboxConfig;
 use crate::template;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Write as _};
 use std::os::unix::process::CommandExt;
-use std::process::Stdio;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use wait_timeout::ChildExt;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixMode {
+    Off,
+    Fix,
+    Redo,
+}
 
 #[derive(Clone)]
 enum RenderMode {
@@ -114,6 +123,8 @@ pub struct RunOptions {
     pub force_sandbox: bool,
     pub no_sandbox: bool,
     pub no_format: bool,
+    pub fix: bool,
+    pub redo: bool,
     pub vars: BTreeMap<String, String>,
 }
 
@@ -139,7 +150,6 @@ pub fn run(config: &Config, targets: &[String], opts: &RunOptions) -> Result<(),
 
     for task_name in &order {
         let task = &config.tasks[task_name];
-        let tool = config.effective_tool(task_name)?;
         let workdir = config.effective_workdir(task);
         let sandbox = config.effective_sandbox(task, opts.force_sandbox, opts.no_sandbox);
         let timeout = config.effective_timeout(task);
@@ -152,123 +162,47 @@ pub fn run(config: &Config, targets: &[String], opts: &RunOptions) -> Result<(),
             sandbox_checked = true;
         }
 
-        let rendered_prompt = template::render(
-            &task.prompt,
-            task_name,
-            &task_outputs,
-            &opts.vars,
-            &task.depends,
-            &capture_flags,
-        )?;
+        let fix_mode = resolve_fix_mode(task, opts);
 
-        let mut rendered_task = task.clone();
-        rendered_task.prompt = rendered_prompt;
-        rendered_task.model = config.effective_model(task);
-
-        let resolved = registry.resolve_or_generic(&tool);
-        let adapter = resolved.adapter();
-
-        let workdir_ref = workdir.as_deref();
-        let sandbox_ref = sandbox.as_ref();
-        let auto_approve = task.auto_approve;
-        let cmd_builder =
-            || adapter.build_command(&rendered_task, workdir_ref, auto_approve, sandbox_ref);
-
-        if opts.dry_run {
-            let cmd = cmd_builder();
-            print_command(task_name, &cmd, timeout, retry.as_ref());
-            continue;
-        }
-
-        report::status_line(&format!("▶ running task: {task_name} (tool: {tool})"));
-
-        let cmd_string = format_command(&cmd_builder());
-
-        let attempt_opts = AttemptOpts {
-            capture: task.capture,
-            timeout,
-            render_mode: &render_mode,
-            idle_warn,
-            idle_kill,
-        };
-        let (result, attempts) =
-            execute_with_retry(task_name, cmd_builder, &attempt_opts, retry.as_ref())?;
-
-        match result {
-            TaskResult::Success(output) => {
-                if let Some(stdout) = output {
-                    task_outputs.insert(task_name.clone(), stdout);
-                }
-            }
-            TaskResult::Failed(code, stderr_tail) => {
-                if opts.keep_going {
-                    report::status_line(&format!(
-                        "✗ task {task_name:?} failed (exit code {code}), continuing..."
-                    ));
-                    failures.push(task_name.clone());
-                } else {
-                    return Err(Error::TaskFailed {
-                        task: task_name.clone(),
-                        code,
-                        attempts,
-                        command: Some(cmd_string),
-                        stderr_tail: Some(stderr_tail),
-                    });
-                }
-            }
-            TaskResult::Signaled(stderr_tail) => {
-                if opts.keep_going {
-                    report::status_line(&format!(
-                        "✗ task {task_name:?} was killed by a signal, continuing..."
-                    ));
-                    failures.push(task_name.clone());
-                } else {
-                    return Err(Error::TaskSignaled {
-                        task: task_name.clone(),
-                        attempts,
-                        command: Some(cmd_string),
-                        stderr_tail: Some(stderr_tail),
-                    });
-                }
-            }
-            TaskResult::TimedOut(stderr_tail) => {
-                let timeout_secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
-                if opts.keep_going {
-                    report::status_line(&format!(
-                        "✗ task {task_name:?} timed out after {timeout_secs}s, continuing..."
-                    ));
-                    failures.push(task_name.clone());
-                } else {
-                    return Err(Error::TaskTimeout {
-                        task: task_name.clone(),
-                        timeout_secs,
-                        attempts,
-                        command: Some(cmd_string),
-                        stderr_tail: Some(stderr_tail),
-                    });
-                }
-            }
-            TaskResult::IdleKilled {
-                stderr_tail,
-                idle_secs,
-                idle_kill_secs,
-            } => {
-                if opts.keep_going {
-                    report::status_line(&format!(
-                        "✗ task {task_name:?} killed after {idle_secs}s of silence (idle limit {idle_kill_secs}s), continuing..."
-                    ));
-                    failures.push(task_name.clone());
-                } else {
-                    return Err(Error::TaskIdleKilled {
-                        task: task_name.clone(),
-                        idle_secs,
-                        idle_kill_secs,
-                        attempts,
-                        command: Some(cmd_string),
-                        stderr_tail: Some(stderr_tail),
-                    });
-                }
-            }
+        if task.script.is_some() {
+            // --- Script task path ---
+            run_script_task(
+                config,
+                task,
+                task_name,
+                opts,
+                &render_mode,
+                &registry,
+                &mut task_outputs,
+                &capture_flags,
+                workdir.as_deref(),
+                sandbox.as_ref(),
+                timeout,
+                retry.as_ref(),
+                idle_warn,
+                idle_kill,
+                fix_mode,
+                &mut failures,
+            )?;
+        } else {
+            // --- Normal AI task path ---
+            run_ai_task(
+                config,
+                task,
+                task_name,
+                opts,
+                &render_mode,
+                &registry,
+                &mut task_outputs,
+                &capture_flags,
+                workdir.as_deref(),
+                sandbox.as_ref(),
+                timeout,
+                retry.as_ref(),
+                idle_warn,
+                idle_kill,
+                &mut failures,
+            )?;
         }
     }
 
@@ -290,6 +224,483 @@ pub fn run(config: &Config, targets: &[String], opts: &RunOptions) -> Result<(),
     Ok(())
 }
 
+fn resolve_fix_mode(task: &crate::config::Task, opts: &RunOptions) -> FixMode {
+    if opts.redo {
+        FixMode::Redo
+    } else if opts.fix {
+        FixMode::Fix
+    } else if task.autoredo {
+        FixMode::Redo
+    } else if task.autofix {
+        FixMode::Fix
+    } else {
+        FixMode::Off
+    }
+}
+
+/// Run a normal AI task (existing behavior).
+fn run_ai_task(
+    config: &Config,
+    task: &crate::config::Task,
+    task_name: &str,
+    opts: &RunOptions,
+    render_mode: &RenderMode,
+    registry: &AdapterRegistry,
+    task_outputs: &mut BTreeMap<String, String>,
+    capture_flags: &BTreeMap<String, bool>,
+    workdir: Option<&Path>,
+    sandbox: Option<&SandboxConfig>,
+    timeout: Option<Duration>,
+    retry: Option<&RetryConfig>,
+    idle_warn: Option<Duration>,
+    idle_kill: Option<Duration>,
+    failures: &mut Vec<String>,
+) -> Result<(), Error> {
+    let tool = config.effective_tool(task_name)?;
+
+    let rendered_prompt = template::render(
+        task.prompt.as_deref().unwrap_or(""),
+        task_name,
+        task_outputs,
+        &opts.vars,
+        &task.depends,
+        capture_flags,
+    )?;
+
+    let mut rendered_task = task.clone();
+    rendered_task.prompt = Some(rendered_prompt);
+    rendered_task.model = config.effective_model(task);
+
+    let resolved = registry.resolve_or_generic(&tool);
+    let adapter = resolved.adapter();
+
+    let auto_approve = task.auto_approve;
+    let cmd_builder = || adapter.build_command(&rendered_task, workdir, auto_approve, sandbox);
+
+    if opts.dry_run {
+        let cmd = cmd_builder();
+        print_command(task_name, &cmd, timeout, retry);
+        return Ok(());
+    }
+
+    report::status_line(&format!("▶ running task: {task_name} (tool: {tool})"));
+
+    let cmd_string = format_command(&cmd_builder());
+
+    let attempt_opts = AttemptOpts {
+        capture: task.capture,
+        timeout,
+        render_mode,
+        idle_warn,
+        idle_kill,
+    };
+    let (result, attempts) =
+        execute_with_retry(task_name, cmd_builder, &attempt_opts, retry)?;
+
+    handle_task_result(
+        result,
+        attempts,
+        task_name,
+        opts.keep_going,
+        Some(cmd_string),
+        timeout,
+        task_outputs,
+        failures,
+    )
+}
+
+/// Run a script task. The script runs as `sh -c <script>`. On failure,
+/// if fix/redo mode is active, the AI is dispatched with the failure context.
+fn run_script_task(
+    config: &Config,
+    task: &crate::config::Task,
+    task_name: &str,
+    opts: &RunOptions,
+    render_mode: &RenderMode,
+    registry: &AdapterRegistry,
+    task_outputs: &mut BTreeMap<String, String>,
+    capture_flags: &BTreeMap<String, bool>,
+    workdir: Option<&Path>,
+    sandbox: Option<&SandboxConfig>,
+    timeout: Option<Duration>,
+    retry: Option<&RetryConfig>,
+    idle_warn: Option<Duration>,
+    idle_kill: Option<Duration>,
+    fix_mode: FixMode,
+    failures: &mut Vec<String>,
+) -> Result<(), Error> {
+    let has_prompt = task.prompt.is_some();
+
+    // If no explicit prompt, use a default one for remediation.
+    let default_prompt = "The script failed. Fix the issue.";
+    let prompt_source = task.prompt.as_deref().unwrap_or(default_prompt);
+
+    // Render the script through the template engine.
+    let rendered_script = template::render(
+        task.script.as_deref().unwrap_or(""),
+        task_name,
+        task_outputs,
+        &opts.vars,
+        &task.depends,
+        capture_flags,
+    )?;
+
+    // Resolve tool only if we might dispatch to AI (fix/redo mode with a prompt).
+    let tool = if fix_mode != FixMode::Off && has_prompt {
+        Some(config.effective_tool(task_name)?)
+    } else {
+        None
+    };
+
+    let max_redo_attempts: u32 = 3;
+    let script_builder = || build_script_command(&rendered_script, workdir, sandbox);
+
+    for redo_attempt in 1..=max_redo_attempts {
+        // --- Run the script ---
+        if opts.dry_run {
+            let cmd = script_builder();
+            print_command(task_name, &cmd, timeout, retry);
+            return Ok(());
+        }
+
+        let phase = if redo_attempt == 1 {
+            String::new()
+        } else {
+            format!(" (redo attempt {redo_attempt}/{max_redo_attempts})")
+        };
+        report::status_line(&format!("▶ running script task: {task_name}{phase}"));
+
+        let attempt_opts = AttemptOpts {
+            capture: task.capture,
+            timeout,
+            render_mode,
+            idle_warn,
+            idle_kill,
+        };
+        let (result, _script_attempts) =
+            execute_with_retry(task_name, script_builder, &attempt_opts, retry)?;
+
+        // Determine exit code and stderr tail from the result.
+        let (exit_code, stderr_tail): (i32, String) = match &result {
+            TaskResult::Success(_) => {
+                // Script succeeded — we're done.
+                if let Some(stdout) = result.into_stdout() {
+                    task_outputs.insert(task_name.to_string(), stdout);
+                }
+                return Ok(());
+            }
+            TaskResult::Failed(code, stderr) => (*code, stderr.clone()),
+            TaskResult::Signaled(stderr) => (-1, stderr.clone()),
+            TaskResult::TimedOut(stderr) => (-1, stderr.clone()),
+            TaskResult::IdleKilled {
+                stderr_tail,
+                ..
+            } => (-1, stderr_tail.clone()),
+        };
+
+        if fix_mode == FixMode::Off {
+            // No fix mode — fail immediately.
+            return handle_failure_outright(
+                task_name, &result, opts.keep_going, timeout, failures,
+            );
+        }
+
+        // --- Fix/redo mode: dispatch remediation to AI ---
+        let context = format!(
+            "Command: {}\nExit code: {}\nstdout:\n{}\n\nstderr:\n{}",
+            task.script.as_deref().unwrap_or(""),
+            exit_code,
+            task_outputs.get(task_name).map(|s| s.as_str()).unwrap_or(""),
+            stderr_tail,
+        );
+
+        let rendered_prompt = template::render(
+            prompt_source,
+            task_name,
+            task_outputs,
+            &opts.vars,
+            &task.depends,
+            capture_flags,
+        )?;
+        let augmented_prompt = format!("{rendered_prompt}\n\n---\n{context}");
+
+        let tool = tool.as_ref().expect("tool must be resolved in fix/redo mode");
+
+        let mut remediate_task = task.clone();
+        remediate_task.prompt = Some(augmented_prompt);
+        remediate_task.model = config.effective_model(task);
+
+        let resolved = registry.resolve_or_generic(tool);
+        let adapter = resolved.adapter();
+        let auto_approve = task.auto_approve;
+        let remediate_cmd_builder =
+            || adapter.build_command(&remediate_task, workdir, auto_approve, sandbox);
+
+        report::status_line(&format!(
+            "▶ dispatching remediation for task: {task_name} (tool: {tool})"
+        ));
+
+        let remediate_opts = AttemptOpts {
+            capture: false,
+            timeout,
+            render_mode,
+            idle_warn,
+            idle_kill,
+        };
+        let (remediate_result, _remediate_attempts) = execute_with_retry(
+            task_name,
+            remediate_cmd_builder,
+            &remediate_opts,
+            retry,
+        )?;
+
+        match remediate_result {
+            TaskResult::Success(_) => {
+                if fix_mode == FixMode::Fix {
+                    // Fix mode: AI fixed it, we're done.
+                    return Ok(());
+                }
+                // Redo mode: loop back to re-run the script.
+                continue;
+            }
+            _ => {
+                // Remediation itself failed.
+                return handle_failure_outright(
+                    &format!("{task_name} (remediation)"),
+                    &remediate_result,
+                    opts.keep_going,
+                    timeout,
+                    failures,
+                );
+            }
+        }
+    }
+
+    // All redo attempts exhausted.
+    Err(Error::RedoMaxAttempts {
+        task: task_name.to_string(),
+        attempts: max_redo_attempts,
+        code: -1,
+        stderr_tail: "all attempts failed".into(),
+    })
+}
+
+/// Build a `Command` to run a script via `sh -c`.
+fn build_script_command(
+    script: &str,
+    workdir: Option<&Path>,
+    sandbox: Option<&SandboxConfig>,
+) -> Command {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c").arg(script);
+
+    // Apply sandbox if configured (wrap in clampdown).
+    if let Some(sb) = sandbox {
+        // Wrap the command in clampdown: clampdown sh -c <script>
+        let mut clampdown_cmd = Command::new("clampdown");
+        clampdown_cmd.arg("sh");
+        for arg in sb.to_args() {
+            clampdown_cmd.arg(arg);
+        }
+        if let Some(dir) = workdir {
+            clampdown_cmd.arg("--workdir").arg(dir);
+        }
+        clampdown_cmd.arg("--");
+        clampdown_cmd.arg("-c").arg(script);
+        return clampdown_cmd;
+    }
+
+    if let Some(dir) = workdir {
+        cmd.current_dir(dir);
+    }
+
+    cmd
+}
+
+/// Handle a failure when there's no fix/redo mode (or remediation failed).
+/// Returns `Err` unless `keep_going` is set, in which case it logs and returns `Ok`.
+fn handle_failure_outright(
+    task_name: &str,
+    result: &TaskResult,
+    keep_going: bool,
+    timeout: Option<Duration>,
+    failures: &mut Vec<String>,
+) -> Result<(), Error> {
+    match result {
+        TaskResult::Success(_) => {
+            // Shouldn't happen, but treat as success.
+            Ok(())
+        }
+        TaskResult::Failed(code, stderr_tail) => {
+            if keep_going {
+                report::status_line(&format!(
+                    "✗ task {task_name:?} failed (exit code {code}), continuing..."
+                ));
+                failures.push(task_name.to_string());
+                Ok(())
+            } else {
+                Err(Error::TaskFailed {
+                    task: task_name.to_string(),
+                    code: *code,
+                    attempts: 1,
+                    command: None,
+                    stderr_tail: Some(stderr_tail.clone()),
+                })
+            }
+        }
+        TaskResult::Signaled(stderr_tail) => {
+            if keep_going {
+                report::status_line(&format!(
+                    "✗ task {task_name:?} was killed by a signal, continuing..."
+                ));
+                failures.push(task_name.to_string());
+                Ok(())
+            } else {
+                Err(Error::TaskSignaled {
+                    task: task_name.to_string(),
+                    attempts: 1,
+                    command: None,
+                    stderr_tail: Some(stderr_tail.clone()),
+                })
+            }
+        }
+        TaskResult::TimedOut(stderr_tail) => {
+            let secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
+            if keep_going {
+                report::status_line(&format!(
+                    "✗ task {task_name:?} timed out after {secs}s, continuing..."
+                ));
+                failures.push(task_name.to_string());
+                Ok(())
+            } else {
+                Err(Error::TaskTimeout {
+                    task: task_name.to_string(),
+                    timeout_secs: secs,
+                    attempts: 1,
+                    command: None,
+                    stderr_tail: Some(stderr_tail.clone()),
+                })
+            }
+        }
+        TaskResult::IdleKilled {
+            stderr_tail,
+            idle_secs,
+            idle_kill_secs,
+        } => {
+            if keep_going {
+                report::status_line(&format!(
+                    "✗ task {task_name:?} killed after {idle_secs}s of silence (limit {idle_kill_secs}s), continuing..."
+                ));
+                failures.push(task_name.to_string());
+                Ok(())
+            } else {
+                Err(Error::TaskIdleKilled {
+                    task: task_name.to_string(),
+                    idle_secs: *idle_secs,
+                    idle_kill_secs: *idle_kill_secs,
+                    attempts: 1,
+                    command: None,
+                    stderr_tail: Some(stderr_tail.clone()),
+                })
+            }
+        }
+    }
+}
+
+/// Handle a task result (Success/Failed/Signaled/TimedOut/IdleKilled).
+fn handle_task_result(
+    result: TaskResult,
+    attempts: u32,
+    task_name: &str,
+    keep_going: bool,
+    cmd_string: Option<String>,
+    timeout: Option<Duration>,
+    task_outputs: &mut BTreeMap<String, String>,
+    failures: &mut Vec<String>,
+) -> Result<(), Error> {
+    match result {
+        TaskResult::Success(output) => {
+            if let Some(stdout) = output {
+                task_outputs.insert(task_name.to_string(), stdout);
+            }
+            Ok(())
+        }
+        TaskResult::Failed(code, stderr_tail) => {
+            if keep_going {
+                report::status_line(&format!(
+                    "✗ task {task_name:?} failed (exit code {code}), continuing..."
+                ));
+                failures.push(task_name.to_string());
+                Ok(())
+            } else {
+                Err(Error::TaskFailed {
+                    task: task_name.to_string(),
+                    code,
+                    attempts,
+                    command: cmd_string,
+                    stderr_tail: Some(stderr_tail),
+                })
+            }
+        }
+        TaskResult::Signaled(stderr_tail) => {
+            if keep_going {
+                report::status_line(&format!(
+                    "✗ task {task_name:?} was killed by a signal, continuing..."
+                ));
+                failures.push(task_name.to_string());
+                Ok(())
+            } else {
+                Err(Error::TaskSignaled {
+                    task: task_name.to_string(),
+                    attempts,
+                    command: cmd_string,
+                    stderr_tail: Some(stderr_tail),
+                })
+            }
+        }
+        TaskResult::TimedOut(stderr_tail) => {
+            let timeout_secs = timeout.map(|d| d.as_secs()).unwrap_or(0);
+            if keep_going {
+                report::status_line(&format!(
+                    "✗ task {task_name:?} timed out after {timeout_secs}s, continuing..."
+                ));
+                failures.push(task_name.to_string());
+                Ok(())
+            } else {
+                Err(Error::TaskTimeout {
+                    task: task_name.to_string(),
+                    timeout_secs,
+                    attempts,
+                    command: cmd_string,
+                    stderr_tail: Some(stderr_tail),
+                })
+            }
+        }
+        TaskResult::IdleKilled {
+            stderr_tail,
+            idle_secs,
+            idle_kill_secs,
+        } => {
+            if keep_going {
+                report::status_line(&format!(
+                    "✗ task {task_name:?} killed after {idle_secs}s of silence (idle limit {idle_kill_secs}s), continuing..."
+                ));
+                failures.push(task_name.to_string());
+                Ok(())
+            } else {
+                Err(Error::TaskIdleKilled {
+                    task: task_name.to_string(),
+                    idle_secs,
+                    idle_kill_secs,
+                    attempts,
+                    command: cmd_string,
+                    stderr_tail: Some(stderr_tail),
+                })
+            }
+        }
+    }
+}
+
 enum TaskResult {
     Success(Option<String>),
     Failed(i32, String),
@@ -300,6 +711,15 @@ enum TaskResult {
         idle_secs: u64,
         idle_kill_secs: u64,
     },
+}
+
+impl TaskResult {
+    fn into_stdout(self) -> Option<String> {
+        match self {
+            TaskResult::Success(stdout) => stdout,
+            _ => None,
+        }
+    }
 }
 
 struct AttemptOpts<'a> {

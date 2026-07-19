@@ -59,7 +59,14 @@ enum SandboxOrBool {
 #[derive(Debug, Deserialize)]
 struct RawTask {
     tool: Option<String>,
-    prompt: String,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    script: Option<String>,
+    #[serde(default)]
+    autofix: bool,
+    #[serde(default)]
+    autoredo: bool,
     #[serde(default)]
     depends: Vec<String>,
     #[serde(default)]
@@ -82,7 +89,10 @@ struct RawTask {
 #[derive(Debug, Clone)]
 pub struct Task {
     pub tool: Option<String>,
-    pub prompt: String,
+    pub prompt: Option<String>,
+    pub script: Option<String>,
+    pub autofix: bool,
+    pub autoredo: bool,
     pub depends: Vec<String>,
     pub capture: bool,
     pub auto_approve: bool,
@@ -108,6 +118,9 @@ impl From<RawTask> for Task {
         Self {
             tool: raw.tool,
             prompt: raw.prompt,
+            script: raw.script,
+            autofix: raw.autofix,
+            autoredo: raw.autoredo,
             depends: raw.depends,
             capture: raw.capture,
             auto_approve: raw.auto_approve,
@@ -158,6 +171,7 @@ impl Config {
             if let Some(retry) = &task.retry {
                 validate_retry(name, retry)?;
             }
+            validate_task(name, task)?;
         }
         if let Some(retry) = &raw.defaults.retry {
             validate_retry("<defaults>", retry)?;
@@ -260,6 +274,26 @@ impl Config {
             .or(self.defaults.idle_kill)
             .map(Duration::from_secs)
     }
+}
+
+fn validate_task(name: &str, task: &Task) -> Result<(), Error> {
+    let has_script = task.script.is_some();
+    let has_prompt = task.prompt.is_some();
+    let wants_fix = task.autofix || task.autoredo;
+
+    if !has_script && !has_prompt {
+        return Err(Error::TaskNoPromptOrScript {
+            task: name.to_string(),
+        });
+    }
+    if !has_script && wants_fix {
+        return Err(Error::NotAScriptTask {
+            task: name.to_string(),
+        });
+    }
+    // If script+autofix/autoredo without explicit prompt, a default prompt
+    // is generated at runtime — this is valid.
+    Ok(())
 }
 
 fn validate_retry(scope: &str, retry: &RetryConfig) -> Result<(), Error> {
@@ -370,7 +404,10 @@ prompt = "Say hello"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
         assert!(cfg.tasks.contains_key("hello"));
-        assert_eq!(cfg.tasks["hello"].prompt, "Say hello");
+        assert_eq!(
+            cfg.tasks["hello"].prompt.as_deref(),
+            Some("Say hello")
+        );
     }
 
     #[test]
@@ -736,5 +773,108 @@ prompt = "x"
 "#;
         let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
         assert!(cfg.effective_model(&cfg.tasks["t"]).is_none());
+    }
+
+    // -- Script task tests --
+
+    #[test]
+    fn script_task_without_prompt_is_ok() {
+        let toml = r#"
+[tasks.s]
+script = "echo hi"
+"#;
+        let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
+        let task = &cfg.tasks["s"];
+        assert_eq!(task.script.as_deref(), Some("echo hi"));
+        assert!(task.prompt.is_none());
+    }
+
+    #[test]
+    fn script_task_with_prompt_is_ok() {
+        let toml = r#"
+[tasks.s]
+script = "cargo build"
+prompt = "fix it"
+autofix = true
+"#;
+        let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
+        let task = &cfg.tasks["s"];
+        assert_eq!(task.script.as_deref(), Some("cargo build"));
+        assert_eq!(task.prompt.as_deref(), Some("fix it"));
+        assert!(task.autofix);
+    }
+
+    #[test]
+    fn script_task_with_autoredo_is_ok() {
+        let toml = r#"
+[tasks.s]
+script = "cargo build"
+prompt = "fix it"
+autoredo = true
+"#;
+        let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
+        let task = &cfg.tasks["s"];
+        assert!(task.autoredo);
+    }
+
+    #[test]
+    fn rejects_task_with_neither_script_nor_prompt() {
+        let toml = r#"
+[tasks.s]
+tool = "claude-code"
+"#;
+        let result = Config::from_str(toml, Path::new("Amakefile"));
+        assert!(matches!(result, Err(Error::TaskNoPromptOrScript { .. })));
+    }
+
+    #[test]
+    fn rejects_autofix_on_non_script_task() {
+        let toml = r#"
+[tasks.s]
+prompt = "x"
+autofix = true
+"#;
+        let result = Config::from_str(toml, Path::new("Amakefile"));
+        assert!(matches!(result, Err(Error::NotAScriptTask { .. })));
+    }
+
+    #[test]
+    fn rejects_autoredo_on_non_script_task() {
+        let toml = r#"
+[tasks.s]
+prompt = "x"
+autoredo = true
+"#;
+        let result = Config::from_str(toml, Path::new("Amakefile"));
+        assert!(matches!(result, Err(Error::NotAScriptTask { .. })));
+    }
+
+    #[test]
+    fn script_task_with_autofix_but_no_prompt_is_ok() {
+        // Without an explicit prompt, a default one is generated at runtime.
+        let toml = r#"
+[tasks.s]
+script = "cargo build"
+autofix = true
+"#;
+        let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
+        let task = &cfg.tasks["s"];
+        assert!(task.script.is_some());
+        assert!(task.prompt.is_none());
+        assert!(task.autofix);
+    }
+
+    #[test]
+    fn script_task_with_autoredo_but_no_prompt_is_ok() {
+        let toml = r#"
+[tasks.s]
+script = "cargo build"
+autoredo = true
+"#;
+        let cfg = Config::from_str(toml, Path::new("Amakefile")).unwrap();
+        let task = &cfg.tasks["s"];
+        assert!(task.script.is_some());
+        assert!(task.prompt.is_none());
+        assert!(task.autoredo);
     }
 }

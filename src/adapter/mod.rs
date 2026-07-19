@@ -83,7 +83,10 @@ mod tests {
     fn make_task(prompt: &str) -> Task {
         Task {
             tool: None,
-            prompt: prompt.into(),
+            prompt: Some(prompt.into()),
+            script: None,
+            autofix: false,
+            autoredo: false,
             depends: vec![],
             capture: false,
             auto_approve: false,

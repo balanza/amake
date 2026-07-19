@@ -43,7 +43,7 @@ impl Adapter for CopilotAdapter {
         if let Some(model) = &task.model {
             cmd.arg("--model").arg(model);
         }
-        cmd.arg(&task.prompt);
+        cmd.arg(task.prompt.as_deref().unwrap_or(""));
         cmd.args(&task.extra_args);
 
         apply_workdir(&mut cmd, sandboxed, workdir);

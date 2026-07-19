@@ -103,9 +103,91 @@ Now review the open PR for correctness.
 """
 ```
 
+### Script tasks (bash + AI remediation)
+
+Instead of dispatching a prompt to an AI tool, a task can run a bash script directly.
+If the script fails, amake can optionally invoke an AI tool to fix the problem.
+
+```toml
+[tasks.rebase]
+script = "git rebase main"
+prompt = "Resolve the conflicts and continue the rebase."
+autofix = true
+```
+
+```
+amake run rebase          # run git rebase with no AI (pure bash alias)
+amake run rebase --fix    # on failure, send prompt to AI tool for a one-shot fix
+amake run rebase --redo   # on failure, AI fixes then re-runs script until clean
+```
+
+The `script` field supports the same `{{...}}` template interpolation as `prompt`:
+
+```toml
+[tasks.rebase]
+script = "git rebase {{vars.branch}}"
+prompt = "Resolve conflicts rebasing against {{vars.branch}}."
+autofix = true
+```
+
+#### Execution modes
+
+| Task config | CLI flags | Behavior |
+|---|---|---|
+| `script` + `prompt` | (none, no autofix/autoredo) | Pure bash alias, no AI |
+| `script` + `prompt` | `--fix` | Run script; if it fails, dispatch `prompt` to AI tool, done |
+| `script` + `prompt` | `--redo` | Run script; if it fails, dispatch AI, then re-run script until clean (max 3 attempts) |
+| `script` + `prompt` + `autofix=true` | (none) | Same as `--fix` (config sets the default) |
+| `script` + `prompt` + `autoredo=true` | (none) | Same as `--redo` (config sets the default) |
+| `script` without `prompt` | `--fix` / `--redo` | Uses a default prompt ("Fix the issue") + auto-injected context |
+| (no `script`) | `--fix` / `--redo` | Ignored (only applies to script tasks) |
+
+CLI flags override config: `autofix=true` + `--redo` → redo mode.
+If both `autofix` and `autoredo` are true, `autoredo` wins.
+
+#### Auto-injected context
+
+When the script fails and the AI is called, amake automatically appends the failure context
+to your prompt. If you didn't define a `prompt` for the task, a default prompt
+`"The script failed. Fix the issue."` is used:
+
+```
+Command: git rebase main
+Exit code: 128
+stdout:
+
+stderr:
+auto-merge failed; fix conflicts and then commit the result.
+```
+
+This lets you write concise prompts without repeating "here's the error":
+
+```toml
+[tasks.build]
+script = "cargo build"
+prompt = """
+Fix the compilation error. Print a report of changes.
+"""
+autofix = true
+```
+
+#### Redo loop
+
+With `--redo` (or `autoredo=true`), after the AI runs, the script is re-run automatically.
+If it still fails, the AI is called again, up to 3 total attempts.
+The final successful run's stdout is what gets captured for `{{tasks.name.stdout}}`.
+
+#### Use cases
+
+- **Rebase with conflict resolution**: `git rebase main` + AI resolves conflicts
+- **Build repair**: `cargo build` + AI fixes compilation errors
+- **Lint/style fixing**: `npx prettier --check .` + AI fixes formatting
+- **Test suite fixer**: `cargo test` + AI fixes failing tests, re-runs until green
+- **Terraform validation**: `terraform validate` + AI fixes config errors
+
 ### Template variables
 
-Prompts support `{{...}}` placeholders from three sources:
+Prompts (and `script`) support `{{...}}` placeholders from three sources:
 
 | Syntax | Source |
 |---|---|
@@ -225,6 +307,8 @@ amake run <TASKS>... [OPTIONS]
   -f, --file <PATH>      Explicit Amakefile path
   --sandbox              Force sandbox for all tasks
   --no-sandbox           Disable sandbox for all tasks
+  --fix                  On script tasks: run script, if it fails dispatch prompt to AI
+  --redo                 On script tasks: run script, if it fails dispatch AI, then re-run until clean
 
 amake list               Show all tasks
 amake adapters           Show built-in adapter names

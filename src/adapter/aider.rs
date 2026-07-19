@@ -37,7 +37,7 @@ impl Adapter for AiderAdapter {
             cmd.arg("--yes");
         }
 
-        cmd.arg("--message").arg(&task.prompt);
+        cmd.arg("--message").arg(task.prompt.as_deref().unwrap_or(""));
 
         for file in &task.files {
             cmd.arg("--file").arg(file);

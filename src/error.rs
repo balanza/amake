@@ -104,6 +104,25 @@ pub enum Error {
     )]
     ClampdownNotFound,
 
+    /// Task has neither `prompt` nor `script`.
+    #[error("task {task:?} has neither `prompt` nor `script` — define at least one")]
+    TaskNoPromptOrScript { task: String },
+
+    /// `autofix`/`autoredo` set on a task without `script`.
+    #[error(
+        "task {task:?} has autofix/autoredo but no `script` — these flags only apply to script tasks"
+    )]
+    NotAScriptTask { task: String },
+
+    /// Redo loop exhausted.
+    #[error("task {task:?} failed after {attempts} fix+redo attempts\n  exit code: {code}\n  stderr:\n    {}", stderr_tail.replace('\n', "\n    "))]
+    RedoMaxAttempts {
+        task: String,
+        attempts: u32,
+        code: i32,
+        stderr_tail: String,
+    },
+
     #[error("{0}")]
     Io(#[from] std::io::Error),
 }
